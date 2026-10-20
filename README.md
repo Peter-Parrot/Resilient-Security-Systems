@@ -6,6 +6,10 @@ non-deterministic system failure/crash.
 **Part 1**  
 We will design and implement a monitoring agent that reliably distinguishes between healthy operations and process crashes (fault detection).
 
-
+### MEMBER LIST:  
+- Peter-Parrot 
+- BusterShrugz
+- 
 ---
+
 Fall 2026 CS-456 mini group project.
