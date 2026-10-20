@@ -9,7 +9,7 @@ We will design and implement a monitoring agent that reliably distinguishes betw
 ### MEMBER LIST:  
 - Peter-Parrot 
 - BusterShrugz
-- 
+- esheffield48 (Ethan Sheffield)
 ---
 
 Fall 2026 CS-456 mini group project.
