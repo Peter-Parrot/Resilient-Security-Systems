@@ -286,3 +286,10 @@ tmbootpicker.efi
 #====================================================#
 
 .~lock.*#
+
+
+
+#Evan's Shenanigans#
+Shenanigans/test_client.py
+Shenanigans/test_daemon.py
+Shenanigans/test_monitor_process.py
