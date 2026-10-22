@@ -79,7 +79,7 @@ Please submit the following via Canvas:
     *   **a. Critical Service Process:** Clean, documented source code for the lightweight security service featuring the non-deterministic crash injection mechanism.
     *   **b. Heartbeat Monitor Process:** Source code for the independent watchdog agent that manages timers/windows, processes incoming heartbeats, and triggers explicit failure alerts upon a crash.
     *   **c. Adversarial Audit Script:** A standalone script or utility designed to attempt heartbeat spoofing, message replay, or false liveness injection against the monitor.
-    *   **d. Role Distribution:** A separate `CONTRIBUTIONS.md` listing each team member's specific contributions to the service, monitor, security audit, and video demo.
+    * **d. Role Distribution:** A separate `docs/CONTRIBUTIONS.md` listing each team member's specific contributions to the service, monitor, security audit, and video demo.
 2.  **Each team must submit a single PDF report** containing:
     *   **a. Names of all teammates:** First and last.
     *   **b. Service Overview:** A concise description of your team's chosen security domain and the simulated failure scenario.
