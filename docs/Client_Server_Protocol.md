@@ -11,7 +11,7 @@
 | :--- | :--- | :---: | :--- |
 | `request_id` | `string` | Yes | Unique id used to correlate responses and trace requests. |
 | `action` | `string` | Yes | One of:<br> `"GET_CERT"` - retrieve a certificate or public key,<br> `"ENCRYPT_KEY"` - Encrypt a session key,<br> `"LIST_KEYS"` - List available key ID's. |
-| `key_id` | `string` | Conditional | Target key/certificate ID (required for `GET_CERT` and `ENCRYPT_KEY`). |
+| `key_id` | `string` | Conditional | Target key/certificate ID (required for `GET_CERT`). |
 | `plaintext_hash` | `string` | Optional | Dummy session key to encrypt when `action == "ENCRYPT_KEY"`. |
 | `client_id` | `string` | No | Identifier of the requesting client. |
 | `timestamp` | `float` | Yes | Unix epoch timestamp (`time.time()`). |
@@ -19,7 +19,7 @@
 ---
 ### Additional Response Fields
 
-Server responses echo `request_id`, `timestamp` (updated to server response time), and—on `"OK"` responses—`action` and `key_id`, along with the following response-specific fields:
+Server responses echo `request_id`, `timestamp` (updated to server response time). On `"OK"` responses, `action` and `key_id` are echoed, along with the following response-specific fields:
 
 | Field | Type | Required | Description |
 | :--- | :--- | :---: | :--- |
@@ -38,7 +38,7 @@ Server responses echo `request_id`, `timestamp` (updated to server response time
 {
   "request_id": "req-1042",
   "action": "GET_CERT",
-  "key_id": "tls-gateway-prod-01",
+  "key_id": "key1",
   "client_id": "client_01",
   "timestamp": 1761073200.125
 }
@@ -80,4 +80,4 @@ Server responses echo `request_id`, `timestamp` (updated to server response time
 The daemon initializes with dummy key IDs so the client has known IDs to query:
 - `"key1"`
 - `"key2"`
-- `"Encryption Key"` (Key Encryption Key for `WRAP_KEY` requests)
+- `"key3"`
