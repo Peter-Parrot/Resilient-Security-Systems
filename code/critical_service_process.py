@@ -47,9 +47,7 @@ KEYS = {
 
 
 def handle_request(request_data):
-    """Processes incoming request dictionary and returns response dictionary."""
-    check_stochastic_crash()
-    
+    """Processes incoming request dictionary and returns response dictionary."""    
     request_id = request_data.get("request_id")
     action = request_data.get("action")
     key_id = request_data.get("key_id")
@@ -78,10 +76,10 @@ def handle_request(request_data):
                 "error": "MISSING_KEY_ID",
                 "message": "Action 'GET_CERT' requires 'key_id'."
             })
-        elif key_id in VAULT_KEYS:
+        elif key_id in KEYS:
             response.update({
                 "status": "OK",
-                "data": VAULT_KEYS[key_id]
+                "data": KEYS[key_id]
             })
         else:
             response.update({
@@ -183,7 +181,6 @@ def service_connection(key, mask):
 
 
 async def send_heartbeats():
-    # Outer loop ensures the client attempts to reconnect if disconnected
     while True:
         try:
             logging.info("Connecting to monitor at %s...", URI)
@@ -193,6 +190,7 @@ async def send_heartbeats():
                 
                 # Inner loop handles the continuous payload delivery
                 while True:
+                    stochastic_crash()
                     payload = json.dumps({"type": "heartbeat"})
                     await websocket.send(payload)
                     logging.info("Heartbeat sent.")
@@ -212,6 +210,12 @@ async def send_heartbeats():
 
 def start_heartbeat_thread():
     asyncio.run(send_heartbeats()) 
+
+def stochastic_crash():
+    if random.random() < 0.1:
+        print("Simulated System Crash, Server is Down")
+        os._exit(1)
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
