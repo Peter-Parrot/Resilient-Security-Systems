@@ -6,6 +6,8 @@ import json
 import time
 import random
 import logging
+import queue
+import threading
 
 CLIENT_ID = "client_01"
 REQUEST_TIMEOUT = 5.0
@@ -65,6 +67,24 @@ def prompt_user_request(request_num):
 
         print(
             f"Invalid action '{action}'. Please choose LIST_KEYS, GET_CERT, ENCRYPT_KEY, or QUIT.")
+
+
+def input_worker(request_queue, ready_for_input):
+    """Background daemon thread that collects user input without blocking socket monitoring."""
+    request_num = 1
+    try:
+        while True:
+            ready_for_input.wait()
+            ready_for_input.clear()
+            if not sel.get_map():
+                break
+            req = prompt_user_request(request_num)
+            request_queue.put(req)
+            if req is None:
+                break
+            request_num += 1
+    except EOFError:
+        request_queue.put(None)
 
 
 def queue_request(data, request):
@@ -223,35 +243,55 @@ if __name__ == "__main__":
             "Invalid port '%s'. Port must be an integer.", sys.argv[2])
         sys.exit(1)
 
-    request_num = 1
     conn_data = start_connection(host, port)
     if conn_data is None:
         sys.exit(1)
 
+    request_queue = queue.Queue()
+    ready_for_input = threading.Event()
+    ready_for_input.set()
+
+    input_thread = threading.Thread(
+        target=input_worker,
+        args=(request_queue, ready_for_input),
+        daemon=True
+    )
+    input_thread.start()
+
+    request_start = None
+    active_request_id = None
+
     try:
         while sel.get_map():
-            request = prompt_user_request(request_num)
-            if request is None:
-                logging.info("Closing client connection.")
-                break
+            if not conn_data.waiting_for_response:
+                try:
+                    request = request_queue.get_nowait()
+                    if request is None:
+                        logging.info("Closing client connection.")
+                        break
+                    queue_request(conn_data, request)
+                    request_start = time.monotonic()
+                    active_request_id = request["request_id"]
+                except queue.Empty:
+                    pass
 
-            queue_request(conn_data, request)
-            request_num += 1
-            request_start = time.monotonic()
+            events = sel.select(timeout=0.2)
+            for key, mask in events:
+                was_waiting = conn_data.waiting_for_response
+                service_connection(key, mask)
+                if was_waiting and not conn_data.waiting_for_response and sel.get_map():
+                    ready_for_input.set()
 
-            # Drive selector until the request is sent and the response arrives (or socket closes)
-            try:
-                while sel.get_map() and conn_data.waiting_for_response:
+            if conn_data.waiting_for_response and request_start is not None:
+                try:
                     if time.monotonic() - request_start >= REQUEST_TIMEOUT:
                         raise TimeoutError(
-                            f"Request {request['request_id']} timed out after {REQUEST_TIMEOUT}s."
+                            f"Request {active_request_id} timed out after {REQUEST_TIMEOUT}s."
                         )
-                    events = sel.select(timeout=0.5)
-                    for key, mask in events:
-                        service_connection(key, mask)
-            except TimeoutError as e:
-                logging.error("%s", e)
-                conn_data.waiting_for_response = False
+                except TimeoutError as e:
+                    logging.error("%s", e)
+                    conn_data.waiting_for_response = False
+                    ready_for_input.set()
 
     except (KeyboardInterrupt, EOFError):
         logging.info("Caught interrupt, stopping client.")
