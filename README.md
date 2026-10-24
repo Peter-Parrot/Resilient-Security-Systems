@@ -8,8 +8,9 @@ We will design and implement a monitoring agent that reliably distinguishes betw
 
 ### MEMBER LIST:  
 - Peter-Parrot 
-- BusterShrugz
+- BusterShrugz (Reese Edens)
 - esheffield48 (Ethan Sheffield)
+- aidan-palmer
 ---
 
 # Project Instructions
