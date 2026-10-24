@@ -15,6 +15,9 @@ from websockets.exceptions import ConnectionClosed
 
 URI = "ws://127.0.0.1:8000"
 HEARTBEAT_INTERVAL = 5
+STOCHASTIC_PROBABLIITY = 0.1
+HOST = "127.0.0.1"
+PORT = 5000
 
 sel = selectors.DefaultSelector()
 
@@ -212,22 +215,18 @@ def start_heartbeat_thread():
     asyncio.run(send_heartbeats()) 
 
 def stochastic_crash():
-    if random.random() < 0.1:
+    if random.random() < STOCHASTIC_PROBABLIITY:
         print("Simulated System Crash, Server is Down")
         os._exit(1)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python critical_service_process.py <host> <port>")
-        sys.exit(1)
-        
-    host, port = sys.argv[1], int(sys.argv[2])
+
     lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    lsock.bind((host, port))
+    lsock.bind((HOST, PORT))
     lsock.listen()
-    print(f"Listening on {(host, port)}")
+    print(f"Listening on {(HOST, PORT)}")
     lsock.setblocking(False)
     sel.register(lsock, selectors.EVENT_READ, data=None)
     
