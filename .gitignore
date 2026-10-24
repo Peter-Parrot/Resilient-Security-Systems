@@ -296,8 +296,14 @@ tmbootpicker.efi
 *.iml
 out/
 
+#====================================================#
+#               Project Specific                     #
+#====================================================#
 
 #Evan's Shenanigans#
 Shenanigans/test_client.py
 Shenanigans/test_daemon.py
 Shenanigans/test_monitor_process.py
+
+#logs
+*.log
