@@ -1,4 +1,5 @@
-import sys
+import argparse
+import math
 import socket
 import selectors
 import types
@@ -50,7 +51,7 @@ KEYS = {
 
 
 def handle_request(request_data):
-    """Processes incoming request dictionary and returns response dictionary."""    
+    """Processes incoming request dictionary and returns response dictionary."""
     request_id = request_data.get("request_id")
     action = request_data.get("action")
     key_id = request_data.get("key_id")
@@ -184,6 +185,7 @@ def service_connection(key, mask):
 
 
 async def send_heartbeats():
+    # Outer loop ensures the client attempts to reconnect if disconnected
     while True:
         try:
             logging.info("Connecting to monitor at %s...", URI)
@@ -221,6 +223,19 @@ def stochastic_crash():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Key service with heartbeat and random failure injection.")
+    parser.add_argument("host", nargs="?", default="127.0.0.1")
+    parser.add_argument("port", nargs="?", type=int, default=5000)
+    parser.add_argument("--crash-probability", type=float, default=0.1,
+                        help="Probability per background check; 0 disables faults (default: 0.1).")
+    parser.add_argument("--crash-interval", type=float, default=5.0,
+                        help="Seconds between random fault checks (default: 5).")
+    args = parser.parse_args()
+    if not math.isfinite(args.crash_probability) or not 0 <= args.crash_probability <= 1:
+        parser.error("Crash probability must be between 0 and 1.")
+    if not math.isfinite(args.crash_interval) or args.crash_interval <= 0:
+        parser.error("Crash interval must be finite and positive.")
+    host, port = args.host, args.port
 
     lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -232,7 +247,12 @@ if __name__ == "__main__":
     
     async_heartbeat_thread = threading.Thread(target=start_heartbeat_thread, daemon=True)
     async_heartbeat_thread.start()
-  
+    if args.crash_probability > 0:
+        logging.info("Random fault checks every %s seconds, probability %s.",
+                     args.crash_interval, args.crash_probability)
+        threading.Thread(target=stochastic_crash,
+                         args=(args.crash_probability, args.crash_interval), daemon=True).start()
+
 
     try:
         while True:

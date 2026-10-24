@@ -11,6 +11,7 @@ import argparse
 import ast
 import asyncio
 import json
+import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,7 +30,6 @@ def capture_logged_heartbeat(log_path):
         if marker not in line:
             continue
 
-        # The monitor logs a Python dictionary, rather than JSON.
         payload = ast.literal_eval(line.split(marker, 1)[1])
 
         if isinstance(payload, dict) and payload.get("type") == "heartbeat":
@@ -39,34 +39,49 @@ def capture_logged_heartbeat(log_path):
 
 async def run_attack(args):
     replay_message = None
-    if args.mode == "replay":
-        replay_message = capture_logged_heartbeat(args.log)
-        print(f"Captured payload: {replay_message}")
+    deadline = None
+    sequence = 1
+    print("Attack armed; waiting for the monitor's heartbeat slot.", flush=True)
 
-    async with connect(MONITOR_URL, ping_interval=None) as websocket:
-        deadline = time.monotonic() + args.duration
-        sequence = 1
+    while deadline is None or time.monotonic() < deadline:
+        if args.mode == "replay" and replay_message is None:
+            try:
+                replay_message = capture_logged_heartbeat(args.log)
+            except (FileNotFoundError, ValueError):
+                await asyncio.sleep(0.5)
+                continue
+            print(f"Captured payload: {replay_message}", flush=True)
 
-        while time.monotonic() < deadline:
-            if args.mode == "false-liveness":
-                # Minimal spoofed heartbeat: no timestamp or sequence.
-                message = json.dumps({"type": "heartbeat"})
-            elif replay_message is not None:
-                # Resend the captured payload unchanged.
-                message = replay_message
-            else:
-                # heartbeat resembling the real service.
-                message = json.dumps({
-                    "type": "heartbeat",
-                    "sequence": sequence,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+        try:
+            async with connect(MONITOR_URL, ping_interval=None, open_timeout=2) as websocket:
+                # A successful WebSocket handshake alone doesn't mean the monitor accepted us: it rejects second clients with 1008.
+                ready = json.loads(await asyncio.wait_for(websocket.recv(), timeout=2))
+                if ready != {"type": "ready"}:
+                    raise ValueError("Unexpected monitor admission message.")
+                if deadline is None:
+                    deadline = time.monotonic() + args.duration
+                    print("Attack active; took over the monitor's heartbeat slot.", flush=True)
+                else:
+                    print("Attack reconnected.", flush=True)
 
-            await websocket.send(message)
-            print(f"{args.mode}: {message}", flush=True)
-
-            sequence += 1
-            await asyncio.sleep(args.interval)
+                while time.monotonic() < deadline:
+                    if args.mode == "false-liveness":
+                        message = json.dumps({"type": "heartbeat"})
+                    elif replay_message is not None:
+                        message = replay_message
+                    else:
+                        message = json.dumps({
+                            "type": "heartbeat",
+                            "sequence": sequence,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                    await websocket.send(message)
+                    print(f"{args.mode}: {message}", flush=True)
+                    sequence += 1
+                    await asyncio.sleep(min(args.interval, max(0, deadline - time.monotonic())))
+        except (OSError, ConnectionClosed, TimeoutError):
+            # Stay armed while the real service owns the slot, don't reset an active attack's timer.
+            await asyncio.sleep(0.5)
 
     print("Attack finished; watch for the monitor's timeout alert.")
 
@@ -75,12 +90,13 @@ def main():
     parser = argparse.ArgumentParser(description="Local heartbeat audit")
     parser.add_argument("mode", choices=["spoof", "replay", "false-liveness"])
     parser.add_argument("--interval", type=float, default=2.0)
-    parser.add_argument("--duration", type=float, default=30.0)
+    parser.add_argument("--duration", type=float, default=30.0,
+                        help="Seconds to attack after admission; waiting time is excluded.")
     parser.add_argument("--log", default="heartbeat.log")
     args = parser.parse_args()
 
-    if args.interval <= 0 or args.duration <= 0:
-        parser.error("Interval and duration must be positive.")
+    if not all(math.isfinite(value) and value > 0 for value in (args.interval, args.duration)):
+        parser.error("Interval and duration must be finite and positive.")
 
     try:
         asyncio.run(run_attack(args))

@@ -34,6 +34,10 @@ logging.basicConfig(
     ]
 )
 
+logging.getLogger("websockets.server").addFilter(
+    lambda record: record.getMessage() not in {"connection open", "connection closed"}
+)
+
 last_heartbeat = None
 server_alive = False
 connected = False
@@ -54,6 +58,7 @@ async def receive_heartbeat(websocket):
     logging.info("Critical server connected.")
 
     try:
+        await websocket.send(json.dumps({"type": "ready"}))
         async for message in websocket:
             try:
                 data = json.loads(message)
