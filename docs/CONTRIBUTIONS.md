@@ -13,7 +13,7 @@ Implemented the heartbeat monitor and the part of the server that sends heartbea
 
 
 ### Reese Edens
-
+Worked on and implemented attacking script and GUI for demo purposes. 
 
 ### Ethan Sheffield
 
