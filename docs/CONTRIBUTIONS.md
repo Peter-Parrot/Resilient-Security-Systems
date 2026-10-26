@@ -16,4 +16,5 @@ Implemented the heartbeat monitor and the part of the server that sends heartbea
 Worked on and implemented attacking script and GUI for demo purposes. 
 
 ### Ethan Sheffield
+Designed the Client <--> Server Communication Protocol and implemented the client process. 
 
