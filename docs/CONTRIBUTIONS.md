@@ -10,7 +10,7 @@ Implemented the heartbeat monitor and the part of the server that sends heartbea
 
 
 ### Evan Zamore
-
+Implemented critical service process
 
 ### Reese Edens
 Worked on and implemented attacking script and GUI for demo purposes. 
