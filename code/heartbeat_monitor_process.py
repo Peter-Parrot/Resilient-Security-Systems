@@ -16,6 +16,8 @@ import asyncio
 import json
 import logging
 import time
+import sys
+from pathlib import Path
 
 from websockets.asyncio.server import serve
 
@@ -24,6 +26,16 @@ PORT = 8000
 
 HEARTBEAT_INTERVAL = 5 # seconds
 TIMEOUT = HEARTBEAT_INTERVAL * 3
+
+# Backup service configuration
+SERVICE_HOST = "127.0.0.1"
+SERVICE_PORT = 5000
+
+BACKUP_SCRIPT = Path(__file__).resolve().parent / "backup_service_process.py"
+
+RECOVERY_TIMEOUT = 10  # seconds
+RECOVERY_CHECK_INTERVAL = 0.5
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +54,9 @@ last_heartbeat = None
 server_alive = False
 connected = False
 monitor_started = None
+
+failover_started = False
+backup_process = None
 
 
 async def receive_heartbeat(websocket):
@@ -85,10 +100,144 @@ async def receive_heartbeat(websocket):
     finally:
         connected = False
         logging.warning("Critical server disconnected.")
+        
+
+async def check_service_health():
+    """Check whether the key-storage service can process requests."""
+    writer = None
+
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(SERVICE_HOST, SERVICE_PORT),
+            timeout=1.0
+        )
+
+        request = {
+            "request_id": "health-check",
+            "action": "LIST_KEYS",
+            "client_id": "heartbeat_monitor",
+            "timestamp": time.time()
+        }
+
+        writer.write((json.dumps(request) + "\n").encode())
+        await asyncio.wait_for(writer.drain(), timeout=1.0)
+
+        response = await asyncio.wait_for(
+            reader.readline(),
+            timeout=1.0
+        )
+
+        data = json.loads(response.decode())
+
+        return (
+            data.get("request_id") == "health-check"
+            and data.get("status") == "OK"
+            and data.get("action") == "LIST_KEYS"
+        )
+
+    except (
+        OSError,
+        TimeoutError,
+        ValueError,
+        json.JSONDecodeError
+    ):
+        return False
+
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+
+
+async def trigger_failover():
+    """Launch the backup service and verify its recovery."""
+    global backup_process, failover_started
+    
+    try:
+        logging.warning("[Failover Triggered] Starting recovery procedure.")
+
+        # Avoid starting a conflicting primary if the old
+        # service is still responding despite missing heartbeats.
+        if await check_service_health():
+            logging.error(
+                "Failover aborted: original service is still responding. "
+                "Possible heartbeat failure."
+            )
+            return
+
+        if not BACKUP_SCRIPT.is_file():
+            logging.error(
+                "Backup script not found: %s",
+                BACKUP_SCRIPT
+            )
+            return
+
+        try:
+            # Start backup as an independent OS process.
+            backup_process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(BACKUP_SCRIPT),
+                SERVICE_HOST,
+                str(SERVICE_PORT)
+            )
+
+            logging.info(
+                "Backup process launched with PID %d",
+                backup_process.pid
+            )
+
+        except OSError as e:
+            logging.error("Failed to launch backup: %s", e)
+            return
+
+        start_time = time.monotonic()
+
+        # Wait until the backup begins processing requests.
+        while time.monotonic() - start_time < RECOVERY_TIMEOUT:
+
+            if backup_process.returncode is None:
+                # Poll for process exit without blocking the monitor.
+                try:
+                    await asyncio.wait_for(
+                        backup_process.wait(),
+                        timeout=0.01
+                    )
+                except TimeoutError:
+                    pass
+
+            if backup_process.returncode is not None:
+                logging.error(
+                    "Backup process exited with code %s",
+                    backup_process.returncode
+                )
+                return
+
+            if await check_service_health():
+                recovery_time = time.monotonic() - start_time
+
+                logging.info(
+                    "[Service Restored] Backup is operational. "
+                    "Recovery took %.2f seconds.",
+                    recovery_time
+                )
+                return
+
+            await asyncio.sleep(RECOVERY_CHECK_INTERVAL)
+
+        logging.error(
+            "Backup failed to become operational within %d seconds.",
+            RECOVERY_TIMEOUT
+        )
+    finally:
+        failover_started = False
+        logging.info("Failover operation finished.")
 
 
 async def check_heartbeat():
-    global server_alive
+    global server_alive, failover_started
 
     while True:
         await asyncio.sleep(0.5)
@@ -114,6 +263,10 @@ async def check_heartbeat():
                 "No heartbeat received for %.2f seconds.",
                 elapsed
             )
+            # Only attempt failover once.
+            if not failover_started:
+                failover_started = True
+                asyncio.create_task(trigger_failover())
 
 
 async def main():
