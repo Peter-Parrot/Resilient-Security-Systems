@@ -11,6 +11,8 @@ import threading
 
 CLIENT_ID = "client_01"
 REQUEST_TIMEOUT = 5.0
+RECONNECT_INTERVAL = 1.0
+MAX_RECONNECT_WAIT = 30.0
 
 sel = selectors.DefaultSelector()
 
@@ -69,14 +71,14 @@ def prompt_user_request(request_num):
             f"Invalid action '{action}'. Please choose LIST_KEYS, GET_CERT, ENCRYPT_KEY, or QUIT.")
 
 
-def input_worker(request_queue, ready_for_input):
+def input_worker(request_queue, ready_for_input, stop_event):
     """Background daemon thread that collects user input without blocking socket monitoring."""
     request_num = 1
     try:
-        while True:
+        while not stop_event.is_set():
             ready_for_input.wait()
             ready_for_input.clear()
-            if not sel.get_map():
+            if stop_event.is_set():
                 break
             req = prompt_user_request(request_num)
             request_queue.put(req)
@@ -97,12 +99,14 @@ def queue_request(data, request):
     msg = (json.dumps(request) + "\n").encode("utf-8")
     data.outb += msg
     data.waiting_for_response = True
+    data.pending_request = request
 
 
-def start_connection(host, port):
+def start_connection(host, port, quiet=False):
     """Initiates a persistent TCP connection and registers it with the selector."""
     server_addr = (host, port)
-    logging.info("Connecting to server at %s...", server_addr)
+    if not quiet:
+        logging.info("Connecting to server at %s...", server_addr)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
     try:
@@ -110,18 +114,21 @@ def start_connection(host, port):
         sock.connect(server_addr)
         sock.setblocking(False)
     except ConnectionRefusedError:
-        logging.error(
-            "Connection refused by %s. Critical service is offline or crashed.",
-            server_addr
-        )
+        if not quiet:
+            logging.error(
+                "Connection refused by %s. Critical service is offline or crashed.",
+                server_addr
+            )
         sock.close()
         return None
     except (socket.timeout, TimeoutError):
-        logging.error("Connection to %s timed out.", server_addr)
+        if not quiet:
+            logging.error("Connection to %s timed out.", server_addr)
         sock.close()
         return None
     except OSError as e:
-        logging.error("Failed to connect to %s: %s", server_addr, e)
+        if not quiet:
+            logging.error("Failed to connect to %s: %s", server_addr, e)
         sock.close()
         return None
 
@@ -131,10 +138,40 @@ def start_connection(host, port):
         addr=server_addr,
         inb=b"",
         outb=b"",
-        waiting_for_response=False
+        waiting_for_response=False,
+        pending_request=None,
+        disconnected=False
     )
     sel.register(sock, events, data=data)
     return data
+
+
+def reconnect_to_service(host, port, pending_request=None):
+    """Attempts to reconnect to the service (e.g. while waiting for backup failover)."""
+    logging.info(
+        "Attempting automatic reconnection to (%s, %d) (waiting for backup failover)...",
+        host, port
+    )
+    deadline = time.monotonic() + MAX_RECONNECT_WAIT
+    while time.monotonic() < deadline:
+        conn_data = start_connection(host, port, quiet=True)
+        if conn_data is not None:
+            logging.info(
+                "Reconnected to service at (%s, %d) after failover.", host, port)
+            if pending_request is not None:
+                logging.info(
+                    "Re-sending interrupted request [%s] to backup service.",
+                    pending_request["request_id"]
+                )
+                queue_request(conn_data, pending_request)
+            return conn_data
+        time.sleep(RECONNECT_INTERVAL)
+
+    logging.error(
+        "Failed to reconnect to (%s, %d) within %.1fs.",
+        host, port, MAX_RECONNECT_WAIT
+    )
+    return None
 
 
 def service_connection(key, mask):
@@ -152,7 +189,7 @@ def service_connection(key, mask):
                     "Server %s closed connection unexpectedly (daemon crashed or stopped).",
                     data.addr
                 )
-                data.waiting_for_response = False
+                data.disconnected = True
                 sel.unregister(sock)
                 sock.close()
                 return
@@ -161,7 +198,7 @@ def service_connection(key, mask):
                 "Connection refused by %s. Critical service is offline or crashed.",
                 data.addr
             )
-            data.waiting_for_response = False
+            data.disconnected = True
             sel.unregister(sock)
             sock.close()
             return
@@ -170,13 +207,13 @@ def service_connection(key, mask):
                 "Connection reset by %s. Critical service crashed!",
                 data.addr
             )
-            data.waiting_for_response = False
+            data.disconnected = True
             sel.unregister(sock)
             sock.close()
             return
         except OSError as e:
             logging.error("Socket error with %s: %s", data.addr, e)
-            data.waiting_for_response = False
+            data.disconnected = True
             sel.unregister(sock)
             sock.close()
             return
@@ -195,6 +232,7 @@ def service_connection(key, mask):
                     "Received malformed JSON response from server.")
             finally:
                 data.waiting_for_response = False
+                data.pending_request = None
 
     if mask & selectors.EVENT_WRITE:
         if data.outb:
@@ -205,7 +243,7 @@ def service_connection(key, mask):
                 pass
             except (ConnectionRefusedError, ConnectionResetError, OSError) as e:
                 logging.error("Failed to send data to %s: %s", data.addr, e)
-                data.waiting_for_response = False
+                data.disconnected = True
                 sel.unregister(sock)
                 sock.close()
 
@@ -249,11 +287,12 @@ if __name__ == "__main__":
 
     request_queue = queue.Queue()
     ready_for_input = threading.Event()
+    stop_event = threading.Event()
     ready_for_input.set()
 
     input_thread = threading.Thread(
         target=input_worker,
-        args=(request_queue, ready_for_input),
+        args=(request_queue, ready_for_input, stop_event),
         daemon=True
     )
     input_thread.start()
@@ -262,7 +301,20 @@ if __name__ == "__main__":
     active_request_id = None
 
     try:
-        while sel.get_map():
+        while not stop_event.is_set():
+            if conn_data is None or getattr(conn_data, "disconnected", False):
+                pending = getattr(conn_data, "pending_request",
+                                  None) if conn_data else None
+                conn_data = reconnect_to_service(
+                    host, port, pending_request=pending)
+                if conn_data is None:
+                    break
+                if conn_data.waiting_for_response and conn_data.pending_request is not None:
+                    request_start = time.monotonic()
+                    active_request_id = conn_data.pending_request["request_id"]
+                else:
+                    ready_for_input.set()
+
             if not conn_data.waiting_for_response:
                 try:
                     request = request_queue.get_nowait()
@@ -279,23 +331,32 @@ if __name__ == "__main__":
             for key, mask in events:
                 was_waiting = conn_data.waiting_for_response
                 service_connection(key, mask)
-                if was_waiting and not conn_data.waiting_for_response and sel.get_map():
+                if (
+                    was_waiting
+                    and not conn_data.waiting_for_response
+                    and not conn_data.disconnected
+                ):
                     ready_for_input.set()
 
-            if conn_data.waiting_for_response and request_start is not None:
-                try:
-                    if time.monotonic() - request_start >= REQUEST_TIMEOUT:
-                        raise TimeoutError(
-                            f"Request {active_request_id} timed out after {REQUEST_TIMEOUT}s."
-                        )
-                except TimeoutError as e:
-                    logging.error("%s", e)
+            if (
+                conn_data is not None
+                and not conn_data.disconnected
+                and conn_data.waiting_for_response
+                and request_start is not None
+            ):
+                if time.monotonic() - request_start >= REQUEST_TIMEOUT:
+                    logging.error(
+                        "Request %s timed out after %.1fs.",
+                        active_request_id, REQUEST_TIMEOUT
+                    )
                     conn_data.waiting_for_response = False
+                    conn_data.pending_request = None
                     ready_for_input.set()
 
     except (KeyboardInterrupt, EOFError):
         logging.info("Caught interrupt, stopping client.")
     finally:
+        stop_event.set()
         for key in list(sel.get_map().values()):
             sel.unregister(key.fileobj)
             key.fileobj.close()
