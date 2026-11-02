@@ -1,10 +1,14 @@
+"""Side-by-side dashboard for passive failover, client requests, and audits."""
 import argparse
+import ast
 from dataclasses import dataclass
 from datetime import datetime
 import math
+import os
 from pathlib import Path
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -13,32 +17,42 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-
 SCRIPTS = {
     "Monitor": "heartbeat_monitor_process.py",
+    "Backup": "backup_service_process.py",
     "Service": "critical_service_process.py",
     "Client": "client.py",
+    "Audit": "adversarial_audit_part2.py",
     "Attack": "adversarial_audit_script.py",
 }
+LABELS = {"Service": "Primary", "Backup": "Standby", "Attack": "Heartbeat attack"}
 POLL_MS = 100
 LOG_LINE_LIMIT = 2000
 
 
 def positive_number(value):
-    """Reject NaN, infinity, zero, and negative timing values."""
     number = float(value)
     if not math.isfinite(number) or number <= 0:
-        raise ValueError(
-            "Timing values must be finite numbers greater than zero.")
+        raise ValueError("Timing values must be finite and greater than zero.")
     return number
 
 
 def monitor_message(line):
-    """Extract the message from this project's timestamp/level log format."""
     parts = line.rstrip().split(" - ", 2)
-    if len(parts) == 3 and parts[1] in {"INFO", "WARNING", "ERROR", "CRITICAL"}:
-        return parts[2]
-    return ""
+    return parts[2] if len(parts) == 3 and parts[1] in {"INFO", "WARNING", "ERROR", "CRITICAL"} else ""
+
+
+def monitor_settings(project_root):
+    """Read literal settings without importing the monitor or opening its log."""
+    settings = {"SERVICE_HOST": "127.0.0.1", "SERVICE_PORT": 5000,
+                "CONTROL_PORT": 5001, "PORT": 8000}
+    tree = ast.parse((project_root / "code" / SCRIPTS["Monitor"]).read_text())
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                if isinstance(target, ast.Name) and target.id in settings:
+                    settings[target.id] = ast.literal_eval(statement.value)
+    return settings
 
 
 @dataclass
@@ -53,157 +67,188 @@ class Child:
 
 
 def collect_output(name, process, events):
-    """Only the Tk main thread may edit widgets; readers just enqueue text."""
+    # Client input prompts do not end in newlines, so stream characters rather
+    # than waiting for readline() to finish a prompt.
     try:
         with process.stdout:
-            for line in process.stdout:
-                events.put((name, process, line))
-    except (OSError, ValueError) as error:
-        events.put((name, process, f"Output reader stopped: {error}\n"))
+            buffer = ""
+            while True:
+                char = process.stdout.read(1)
+                if not char:
+                    if buffer:
+                        events.put((name, process, buffer))
+                    break
+                buffer += char
+                if char == "\n" or (name == "Client" and buffer.endswith(": ")):
+                    events.put((name, process, buffer))
+                    buffer = ""
+    except (OSError, ValueError) as exc:
+        events.put((name, process, f"Output reader stopped: {exc}\n"))
 
 
 class DemoApp:
     def __init__(self, root, project_root):
-        self.root = root
-        self.project_root = project_root
+        self.root, self.project_root = root, project_root
+        self.settings = monitor_settings(project_root)
         self.children = {name: Child() for name in SCRIPTS}
         self.events = queue.Queue()
         self.closing = False
-        self.monitor_ready = False
-        self.monitor_connected = False
+        self.starting_demo = False
+        self.monitor_ready = self.monitor_connected = False
+        self.backup_ready = self.service_ready = False
+        self.client_ready = False
+        self.active_role = None
         self.reported_health = "UNKNOWN"
-        self.timeout_seconds = None
+        self.timeout_seconds = 15.0
         self.heartbeat_count = 0
         self.last_heartbeat_at = None
         self.service_stopped_at = None
-        self.service_has_run = False
         self.attack_active = False
-        self.logs = {}
-        self.states = {}
-        self.buttons = {}
-        self.client_action = tk.StringVar(value="LIST_KEYS")
+        self.logs, self.states, self.buttons = {}, {}, {}
+        self.client_action = tk.StringVar(value="GET_STATE")
         self.client_key_id = tk.StringVar(value="key1")
         self.client_plaintext = tk.StringVar(value="")
-        self.send_client_button = None
+        self.probability = tk.StringVar(value="0.3")
+        self.crash_interval = tk.StringVar(value="3")
+        self.audit_mode = tk.StringVar(value="checkpoint")
         self.mode = tk.StringVar(value="false-liveness")
         self.interval = tk.StringVar(value="2")
         self.duration = tk.StringVar(value="30")
-        self.health_text = tk.StringVar(value="UNKNOWN")
+        self.health_text = tk.StringVar(value="Waiting to start")
         self.beat_text = tk.StringVar(value="No heartbeats received")
-        self.observation = tk.StringVar(
-            value="Start the monitor, then the service.")
+        self.observation = tk.StringVar(value="Start Demo opens the monitor, standby, primary, then client.")
         self.build_window()
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.tick()
 
     def build_window(self):
-        self.root.title("Mini Project One")
-        self.root.geometry("980x840")
-        self.root.minsize(780, 700)
-        outer = ttk.Frame(self.root, padding=16)
+        self.root.title("Passive Redundancy Demo")
+        width = min(1440, self.root.winfo_screenwidth() - 60)
+        height = min(980, self.root.winfo_screenheight() - 100)
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(1050, 700)
+        outer = ttk.Frame(self.root, padding=12)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="Heartbeat Security", font=(
-            "TkDefaultFont", 20, "bold")).pack(anchor="w")
-        ttk.Label(outer, text=f"Project: {self.project_root}", wraplength=900).pack(
-            anchor="w", pady=(4, 12))
+        title = ttk.Frame(outer)
+        title.pack(fill="x")
+        ttk.Label(title, text="Passive Redundancy", font=("TkDefaultFont", 19, "bold")).pack(side="left")
+        self.start_demo_button = ttk.Button(title, text="Start Demo", command=self.start_demo)
+        self.start_demo_button.pack(side="right", padx=4)
+        ttk.Button(title, text="Stop All", command=self.stop_all).pack(side="right", padx=4)
+        ttk.Button(title, text="Clear Logs", command=self.clear_logs).pack(side="right", padx=4)
+        ttk.Label(outer, text=f"Service {self.settings['SERVICE_HOST']}:{self.settings['SERVICE_PORT']}  ·  "
+                  f"Standby control {self.settings['CONTROL_PORT']}  ·  Heartbeats {self.settings['PORT']}").pack(anchor="w", pady=(3, 8))
 
-        controls = ttk.LabelFrame(
-            outer, text="Processes launched by this window", padding=10)
+        controls = ttk.Frame(outer)
         controls.pack(fill="x")
-        controls.columnconfigure(3, weight=1)
-        for row, name in enumerate(SCRIPTS):
-            ttk.Label(controls, text=name, width=12).grid(
-                row=row, column=0, sticky="w", pady=4)
-            start = ttk.Button(controls, text="Start",
-                               command=lambda n=name: self.start(n))
-            start.grid(row=row, column=1, padx=4)
-            stop = ttk.Button(controls, text="Stop",
-                              command=lambda n=name: self.stop(n))
-            stop.grid(row=row, column=2, padx=4)
-            state = tk.StringVar(value="Not started")
-            ttk.Label(controls, textvariable=state).grid(
-                row=row, column=3, sticky="w", padx=12)
-            self.states[name] = state
-            self.buttons[name] = (start, stop)
+        for column, name in enumerate(("Monitor", "Backup", "Service", "Client")):
+            controls.columnconfigure(column, weight=1)
+            card = ttk.LabelFrame(controls, text=LABELS.get(name, name), padding=6)
+            card.grid(row=0, column=column, sticky="nsew", padx=3)
+            self.process_controls(card, name)
+        fault = ttk.Frame(outer)
+        fault.pack(fill="x", pady=6)
+        ttk.Label(fault, text="Primary crash probability").pack(side="left")
+        ttk.Entry(fault, textvariable=self.probability, width=6).pack(side="left", padx=5)
+        ttk.Label(fault, text="Check every (seconds)").pack(side="left")
+        ttk.Entry(fault, textvariable=self.crash_interval, width=6).pack(side="left", padx=5)
+        ttk.Label(fault, text="0 disables random crashes; settings apply on the next primary start.").pack(side="left", padx=8)
 
-        client_frame = ttk.LabelFrame(
-            outer, text="Client Requests", padding=10)
-        client_frame.pack(fill="x", pady=(10, 0))
-        ttk.Label(client_frame, text="Action").grid(row=0, column=0, padx=4)
-        ttk.Combobox(
-            client_frame,
-            textvariable=self.client_action,
-            values=("LIST_KEYS", "GET_CERT", "ENCRYPT_KEY"),
-            state="readonly",
-            width=14,
-        ).grid(row=0, column=1, padx=4)
-        ttk.Label(client_frame, text="Key ID").grid(row=0, column=2, padx=4)
-        ttk.Combobox(
-            client_frame,
-            textvariable=self.client_key_id,
-            values=("key1", "key2", "key3"),
-            width=10,
-        ).grid(row=0, column=3, padx=4)
-        ttk.Label(client_frame, text="Plaintext Hash").grid(
-            row=0, column=4, padx=4)
-        ttk.Entry(client_frame, textvariable=self.client_plaintext,
-                  width=22).grid(row=0, column=5, padx=4)
-        self.send_client_button = ttk.Button(
-            client_frame, text="Send Request", command=self.send_client_request
-        )
-        self.send_client_button.grid(row=0, column=6, padx=8)
-        ttk.Label(
-            client_frame,
-            text="Start the service, then start the client to open a persistent TCP session. Use 'Send Request' to query the vault.",
-            wraplength=850,
-        ).grid(row=1, column=0, columnspan=7, sticky="w", pady=(8, 0))
+        health = ttk.Frame(outer)
+        health.pack(fill="x", pady=(0, 6))
+        ttk.Label(health, textvariable=self.health_text, font=("TkDefaultFont", 13, "bold")).pack(side="left")
+        ttk.Label(health, textvariable=self.beat_text).pack(side="right")
+        ttk.Label(outer, textvariable=self.observation, wraplength=1200).pack(anchor="w", pady=(0, 6))
 
-        attack = ttk.LabelFrame(outer, text="Attack settings", padding=10)
-        attack.pack(fill="x", pady=10)
-        ttk.Label(attack, text="Mode").grid(row=0, column=0, padx=4)
-        ttk.Combobox(attack, textvariable=self.mode, values=(
-            "spoof", "replay", "false-liveness"), state="readonly", width=18).grid(row=0, column=1, padx=4)
-        ttk.Label(attack, text="Interval (s)").grid(row=0, column=2, padx=4)
-        ttk.Entry(attack, textvariable=self.interval,
-                  width=8).grid(row=0, column=3, padx=4)
-        ttk.Label(attack, text="Duration (s)").grid(row=0, column=4, padx=4)
-        ttk.Entry(attack, textvariable=self.duration,
-                  width=8).grid(row=0, column=5, padx=4)
-        ttk.Label(attack, text="Start the service, then arm the attack. It takes over automatically after the service crashes; duration starts at takeover.",
-                  wraplength=850).grid(row=1, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        split = ttk.Panedwindow(outer, orient="vertical")
+        split.pack(fill="both", expand=True)
+        core = ttk.Frame(split)
+        split.add(core, weight=3)
+        for column, name in enumerate(("Service", "Monitor", "Backup")):
+            core.columnconfigure(column, weight=1, uniform="logs")
+            core.rowconfigure(0, weight=1)
+            panel = ttk.LabelFrame(core, text=LABELS.get(name, name), padding=4)
+            panel.grid(row=0, column=column, sticky="nsew", padx=3)
+            self.log_panel(panel, name)
 
-        health = ttk.LabelFrame(
-            outer, text="What the monitor reports", padding=10)
-        health.pack(fill="x")
-        ttk.Label(health, textvariable=self.health_text, font=(
-            "TkDefaultFont", 16, "bold")).pack(anchor="w")
-        ttk.Label(health, textvariable=self.beat_text).pack(anchor="w", pady=4)
-        ttk.Label(health, textvariable=self.observation,
-                  wraplength=900).pack(anchor="w")
+        bottom = ttk.Frame(split)
+        split.add(bottom, weight=2)
+        bottom.columnconfigure(0, weight=1, uniform="bottom")
+        bottom.columnconfigure(1, weight=1, uniform="bottom")
+        bottom.rowconfigure(0, weight=1)
+        client = ttk.LabelFrame(bottom, text="Client requests and responses", padding=6)
+        client.grid(row=0, column=0, sticky="nsew", padx=3, pady=(6, 0))
+        row = ttk.Frame(client)
+        row.pack(fill="x")
+        ttk.Combobox(row, textvariable=self.client_action,
+                     values=("GET_STATE", "LIST_KEYS", "GET_CERT", "ENCRYPT_KEY"),
+                     state="readonly", width=14).pack(side="left")
+        self.send_client_button = ttk.Button(row, text="Send", command=self.send_client_request)
+        self.send_client_button.pack(side="left", padx=6)
+        fields = ttk.Frame(client)
+        fields.pack(fill="x", pady=4)
+        fields.columnconfigure(1, weight=1)
+        ttk.Label(fields, text="Key ID").grid(row=0, column=0, sticky="w")
+        ttk.Entry(fields, textvariable=self.client_key_id).grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Label(fields, text="Plaintext hash").grid(row=1, column=0, sticky="w")
+        ttk.Entry(fields, textvariable=self.client_plaintext).grid(row=1, column=1, sticky="ew", padx=5)
+        self.log_panel(client, "Client")
 
-        tabs = ttk.Notebook(outer)
-        tabs.pack(fill="both", expand=True, pady=10)
-        for name in SCRIPTS:
-            panel = ttk.Frame(tabs)
-            tabs.add(panel, text=name)
-            log = ScrolledText(panel, height=12, wrap="word",
-                               state="disabled", font=("TkFixedFont", 11))
-            log.pack(fill="both", expand=True)
-            self.logs[name] = log
+        tabs = ttk.Notebook(bottom)
+        tabs.grid(row=0, column=1, sticky="nsew", padx=3, pady=(6, 0))
+        audit = ttk.Frame(tabs, padding=6)
+        tabs.add(audit, text="Part 2 audits")
+        audit_controls = ttk.Frame(audit)
+        audit_controls.pack(fill="x")
+        ttk.Combobox(audit_controls, textvariable=self.audit_mode,
+                     values=("checkpoint", "split-brain"), state="readonly", width=15).pack(side="left")
+        self.process_controls(audit_controls, "Audit")
+        ttk.Label(audit, text="Stop the demo first. Each audit launches its own isolated test processes.",
+                  wraplength=580).pack(anchor="w", pady=4)
+        self.log_panel(audit, "Audit")
+        attack = ttk.Frame(tabs, padding=6)
+        tabs.add(attack, text="Part 1 heartbeat attack")
+        row = ttk.Frame(attack)
+        row.pack(fill="x")
+        ttk.Combobox(row, textvariable=self.mode, values=("spoof", "replay", "false-liveness"),
+                     state="readonly", width=15).pack(side="left")
+        self.process_controls(row, "Attack")
+        timing = ttk.Frame(attack)
+        timing.pack(fill="x", pady=4)
+        for label, variable in (("Interval (s)", self.interval), ("Duration (s)", self.duration)):
+            ttk.Label(timing, text=label).pack(side="left")
+            ttk.Entry(timing, textvariable=variable, width=6).pack(side="left", padx=5)
+        self.log_panel(attack, "Attack")
 
-        footer = ttk.Frame(outer)
-        footer.pack(fill="x")
-        ttk.Button(footer, text="Stop All",
-                   command=self.stop_all).pack(side="left")
-        ttk.Button(footer, text="Clear Displayed Logs",
-                   command=self.clear_logs).pack(side="left", padx=8)
-        ttk.Label(
-            footer, text="Only GUI-launched processes are tracked.").pack(side="right")
+    def process_controls(self, parent, name):
+        start = ttk.Button(parent, text="Run" if name == "Audit" else "Start", width=7,
+                           command=lambda: self.start(name))
+        stop = ttk.Button(parent, text="Stop", width=6, command=lambda: self.stop(name))
+        start.pack(side="left", padx=2)
+        stop.pack(side="left", padx=2)
+        self.states[name] = tk.StringVar(value="Not started")
+        ttk.Label(parent, textvariable=self.states[name]).pack(side="left", padx=4)
+        self.buttons[name] = start, stop
+
+    def log_panel(self, parent, name):
+        log = ScrolledText(parent, height=7, width=30, wrap="word", state="disabled", font=("TkFixedFont", 10))
+        log.pack(fill="both", expand=True)
+        log.tag_configure("error", foreground="#b42318")
+        log.tag_configure("success", foreground="#067647")
+        log.tag_configure("event", foreground="#175cd3")
+        self.logs[name] = log
 
     def append_log(self, name, text):
+        tag = ""
+        if "[Service Restored]" in text or "PASS" in text or "STATUS=OK" in text:
+            tag = "success"
+        elif any(word in text for word in ("ERROR", "CRITICAL", "Traceback", "[Simulated Crash]")):
+            tag = "error"
+        elif any(word in text for word in ("[Failover Triggered]", "Promotion", "WARM STANDBY")):
+            tag = "event"
         widget = self.logs[name]
         widget.configure(state="normal")
-        widget.insert("end", text)
+        widget.insert("end", text, tag)
         lines = int(widget.index("end-1c").split(".")[0])
         if lines > LOG_LINE_LIMIT:
             widget.delete("1.0", f"{lines - LOG_LINE_LIMIT + 1}.0")
@@ -219,289 +264,294 @@ class DemoApp:
             widget.delete("1.0", "end")
             widget.configure(state="disabled")
 
-    def send_client_request(self):
-        client = self.children["Client"]
-        if not client.running or client.process is None or client.process.stdin is None:
-            messagebox.showinfo("Client not running",
-                                "Start the Client process first.")
+    def start_demo(self):
+        if any(child.running for child in self.children.values()):
+            messagebox.showinfo("Processes running", "Stop All and wait for the processes to exit before starting a fresh demo.")
             return
+        self.children = {name: Child() for name in SCRIPTS}
+        self.starting_demo = True
+        self.backup_ready = self.service_ready = False
+        if not self.start("Monitor"):
+            self.starting_demo = False
 
-        action = self.client_action.get().strip().upper()
-        lines = [action]
-        if action == "GET_CERT":
-            lines.append(self.client_key_id.get().strip())
-        elif action == "ENCRYPT_KEY":
-            lines.append(self.client_plaintext.get().strip())
-
-        payload = "\n".join(lines) + "\n"
-        try:
-            client.process.stdin.write(payload)
-            client.process.stdin.flush()
-            self.note(
-                "Client", f"Dispatched {action} request to client stdin.")
-        except (BrokenPipeError, OSError) as error:
-            self.note("Client", f"Failed to write to client stdin: {error}")
+    def start_arguments(self, name):
+        target = [self.settings["SERVICE_HOST"], str(self.settings["SERVICE_PORT"])]
+        if name == "Service":
+            probability = float(self.probability.get())
+            if not math.isfinite(probability) or not 0 <= probability <= 1:
+                raise ValueError("Crash probability must be between zero and one.")
+            interval = positive_number(self.crash_interval.get())
+            return target + ["--crash-probability", str(probability), "--crash-interval", str(interval)]
+        if name == "Backup":
+            return target + ["--standby", "--control-port", str(self.settings["CONTROL_PORT"])]
+        if name == "Client":
+            return target
+        if name == "Audit":
+            return [self.audit_mode.get()]
+        if name == "Attack":
+            return [self.mode.get(), "--interval", str(positive_number(self.interval.get())),
+                    "--duration", str(positive_number(self.duration.get())),
+                    "--log", str(self.project_root / "heartbeat.log")]
+        return []
 
     def start(self, name):
         if self.closing or self.children[name].running:
-            return
-        if name == "Client" and not self.children["Service"].running:
-            messagebox.showinfo(
-                "Service not running", "Start the Service before starting the Client.")
-            return
-        if name not in ("Monitor", "Client") and not self.monitor_ready:
-            messagebox.showinfo(
-                "Monitor not ready", "Start the monitor and wait until it is listening.")
-            return
-        if name == "Service" and (self.children["Attack"].running or self.monitor_connected):
-            messagebox.showinfo(
-                "Monitor busy", "Stop the attack and wait for the monitor to log its disconnect.")
-            return
-        arguments = []
-        if name in ("Service", "Client"):
-            arguments = ["127.0.0.1", "5000"]
-        if name == "Attack":
-            try:
-                interval = positive_number(self.interval.get())
-                duration = positive_number(self.duration.get())
-            except ValueError:
-                messagebox.showerror(
-                    "Invalid timing", "Interval and duration must be finite numbers greater than zero.")
-                return
-            arguments = [self.mode.get(), "--interval", str(interval), "--duration",
-                         str(duration), "--log", str(self.project_root / "heartbeat.log")]
-
+            return False
+        if name == "Audit":
+            if any(child.running for key, child in self.children.items() if key != "Audit"):
+                messagebox.showinfo("Stop demo first", "The audit launches its own processes on the same ports. Click Stop All and wait before running it.")
+                return False
+        elif self.children["Audit"].running:
+            messagebox.showinfo("Audit running", "Wait for the audit to finish or stop it before starting the demo.")
+            return False
+        if name == "Client" and not (self.service_ready or self.active_role == "backup"):
+            messagebox.showinfo("Service not ready", "Wait for the primary or promoted backup to start listening.")
+            return False
+        if name in ("Service", "Backup", "Attack") and not self.monitor_ready:
+            messagebox.showinfo("Monitor not ready", "Start the monitor and wait for its listener.")
+            return False
+        if name == "Service" and (self.monitor_connected or self.children["Attack"].running):
+            messagebox.showinfo("Service already active", "Stop All before starting another primary after failover or an attack.")
+            return False
+        try:
+            arguments = self.start_arguments(name)
+        except ValueError as exc:
+            messagebox.showerror("Invalid settings", str(exc))
+            return False
         script = self.project_root / "code" / SCRIPTS[name]
-        if not script.is_file():
-            messagebox.showerror("Missing script", f"Cannot find:\n{script}")
-            return
-        stdin_mode = subprocess.PIPE if name == "Client" else subprocess.DEVNULL
         try:
             process = subprocess.Popen(
-                [sys.executable, "-u", str(script), *arguments],
-                cwd=self.project_root,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=stdin_mode,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-        except OSError as error:
-            messagebox.showerror("Could not start process", str(error))
-            return
-
+                [sys.executable, "-u", str(script), *arguments], cwd=self.project_root,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE if name == "Client" else subprocess.DEVNULL,
+                start_new_session=(os.name == "posix"),
+                text=True, encoding="utf-8", errors="replace")
+        except OSError as exc:
+            messagebox.showerror("Could not start process", str(exc))
+            return False
         self.children[name] = Child(process=process)
         if name == "Monitor":
-            self.monitor_ready = False
-            self.monitor_connected = False
-            self.reported_health = "UNKNOWN"
-            self.timeout_seconds = None
-            self.heartbeat_count = 0
-            self.last_heartbeat_at = None
+            self.monitor_ready = self.monitor_connected = False
+            self.reported_health, self.active_role = "UNKNOWN", None
+            self.heartbeat_count, self.last_heartbeat_at = 0, None
+        elif name == "Backup":
+            self.backup_ready = False
         elif name == "Service":
-            self.service_has_run = True
-            self.service_stopped_at = None
+            self.service_ready, self.service_stopped_at = False, None
+        elif name == "Client":
+            self.client_ready = False
         elif name == "Attack":
             self.attack_active = False
         self.note(name, f"Started PID {process.pid}.")
-        threading.Thread(target=collect_output, args=(
-            name, process, self.events), daemon=True).start()
-        self.update_display()
+        threading.Thread(target=collect_output, args=(name, process, self.events), daemon=True).start()
+        return True
+
+    def signal_child(self, child, sig):
+        if child.process is None:
+            return
+        try:
+            if os.name == "posix":
+                # Each launch owns a fresh process group. Include audit-created
+                # children and resume SIGSTOP targets so they can terminate.
+                os.killpg(child.process.pid, signal.SIGCONT)
+                os.killpg(child.process.pid, sig)
+            elif child.running:
+                child.process.kill() if sig == signal.SIGKILL else child.process.terminate()
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            self.note("Monitor", f"Could not stop process group: {exc}")
 
     def stop(self, name):
         child = self.children[name]
-        if not child.running or child.stop_deadline is not None:
+        if child.process is None or child.stop_deadline is not None:
             return
-        child.stop_deadline = time.monotonic() + 2
-        self.note(
-            name, "Stop requested; this is a manual stop, not an injected random crash.")
+        if child.running:
+            child.stop_deadline = time.monotonic() + 2
+            self.note(name, "Manual stop requested.")
+        self.signal_child(child, signal.SIGTERM)
         if name == "Monitor":
             self.monitor_ready = False
-            self.reported_health = "UNKNOWN"
-        if name == "Client" and child.process is not None and child.process.stdin is not None:
-            try:
-                child.process.stdin.write("QUIT\n")
-                child.process.stdin.flush()
-            except OSError:
-                pass
-        try:
-            child.process.terminate()
-        except ProcessLookupError:
-            pass
-        except OSError as error:
-            self.note(name, f"Could not terminate: {error}")
+        elif name == "Client":
+            self.client_ready = False
 
     def stop_all(self):
-        for name in ("Client", "Attack", "Service", "Monitor"):
+        self.starting_demo = False
+        self.service_ready = self.backup_ready = self.client_ready = False
+        self.active_role = None
+        for name in ("Client", "Attack", "Audit", "Service", "Backup", "Monitor"):
             self.stop(name)
 
     def close(self):
         self.closing = True
         self.stop_all()
 
+    def send_client_request(self):
+        child = self.children["Client"]
+        if not child.running or not self.client_ready:
+            return
+        action = self.client_action.get()
+        lines = [action]
+        if action == "GET_CERT":
+            lines.append(self.client_key_id.get().strip())
+        elif action == "ENCRYPT_KEY":
+            lines.append(self.client_plaintext.get().strip())
+        try:
+            child.process.stdin.write("\n".join(lines) + "\n")
+            child.process.stdin.flush()
+            self.client_ready = False
+            self.note("Client", f"Sent {action}.")
+        except (OSError, ValueError) as exc:
+            self.note("Client", f"Cannot send request: {exc}")
+
     def read_monitor_event(self, line):
         event = monitor_message(line)
         if event.startswith("server listening on "):
-            # websockets emits this after binding; the project's earlier
-            # 'Heartbeat monitor listening' message occurs before binding.
             self.monitor_ready = True
-        match = re.fullmatch(
-            r"Timeout threshold: (\d+(?:\.\d+)?) seconds", event)
-        if match:
-            self.timeout_seconds = float(match.group(1))
-        if event == "Critical server connected.":
+        timeout = re.search(r"(?:timeout |Timeout threshold: )(\d+(?:\.\d+)?)(?:s| seconds)$", event)
+        if timeout:
+            self.timeout_seconds = float(timeout.group(1))
+        if event in ("Heartbeat sender connected", "Critical server connected."):
             self.monitor_connected = True
-        elif event == "Critical server disconnected.":
+        elif event in ("Heartbeat sender disconnected", "Critical server disconnected."):
             self.monitor_connected = False
-        elif event == "Critical server is ONLINE.":
+        elif event.startswith("Critical service is ONLINE") or event == "Critical server is ONLINE.":
             self.reported_health = "ONLINE"
-        elif event.startswith("ALERT: Critical server is DOWN!"):
+            self.active_role = "backup" if "role=backup" in event else "primary"
+        elif event.startswith(("[Crash Detected]", "ALERT: Critical server is DOWN!")):
             self.reported_health = "DOWN"
-        elif event.startswith("Heartbeat received: "):
+            self.active_role = None
+        elif event.startswith("[Failover Triggered]"):
+            self.reported_health = "RECOVERING"
+        elif event.startswith("[Service Restored]"):
+            self.reported_health, self.active_role = "ONLINE", "backup"
+        elif event.startswith("Heartbeat received:"):
             self.heartbeat_count += 1
             self.last_heartbeat_at = time.monotonic()
 
     def update_display(self):
-        monitor = self.children["Monitor"]
-        monitor_active = monitor.running and monitor.stop_deadline is None
-        available = monitor_active and self.monitor_ready
-        service = self.children["Service"]
-        service_active = service.running and service.stop_deadline is None
+        monitor_active = self.children["Monitor"].running and self.monitor_ready
+        audit_running = self.children["Audit"].running
         for name, child in self.children.items():
-            running = child.running
-            if running:
-                state = f"Running (PID {child.process.pid})"
-                if child.stop_deadline is not None:
-                    state = "Stopping..."
-                elif name == "Monitor" and not self.monitor_ready:
-                    state = "Starting; waiting for listener..."
+            state = "Not started" if child.process is None else f"Exited ({child.process.returncode})"
+            if child.running:
+                state = f"Running · {child.process.pid}"
+                if child.stop_deadline:
+                    state = "Stopping…"
+                elif name == "Backup":
+                    state = "Serving" if self.active_role == "backup" else "Waiting for promotion"
                 elif name == "Attack":
-                    state = "Active; sending fake heartbeats" if self.attack_active else "Armed; waiting to take over"
-            elif child.process is None:
-                state = "Not started"
-            else:
-                state = f"Stopped (exit {child.process.returncode})"
+                    state = "Sending heartbeats" if self.attack_active else "Armed"
             self.states[name].set(state)
-            can_start = not running and not self.closing
-            if name == "Client":
-                can_start = can_start and service_active
+            allowed = not child.running and not self.closing and not audit_running
+            if name == "Audit":
+                allowed = not self.closing and not any(c.running for c in self.children.values())
+            elif name == "Client":
+                allowed = allowed and (self.service_ready or self.active_role == "backup")
             elif name != "Monitor":
-                can_start = can_start and available
+                allowed = allowed and monitor_active
                 if name == "Service":
-                    can_start = can_start and not self.monitor_connected and not self.children[
-                        "Attack"].running
-            self.buttons[name][0].configure(
-                state="normal" if can_start else "disabled")
-            self.buttons[name][1].configure(
-                state="normal" if running and child.stop_deadline is None and not self.closing else "disabled")
-
-        if self.send_client_button is not None:
-            client_child = self.children["Client"]
-            client_ready = client_child.running and client_child.stop_deadline is None and not self.closing
-            self.send_client_button.configure(
-                state="normal" if client_ready else "disabled")
-
-        health = self.reported_health if monitor_active else "UNKNOWN (monitor stopped)"
-        self.health_text.set(health)
-        if self.last_heartbeat_at is None:
-            self.beat_text.set(
-                "No heartbeats received in this monitor session")
+                    allowed = allowed and not self.monitor_connected and not self.children["Attack"].running
+            self.buttons[name][0].configure(state="normal" if allowed else "disabled")
+            self.buttons[name][1].configure(state="normal" if child.running and not child.stop_deadline else "disabled")
+        idle = not any(child.running for child in self.children.values())
+        self.start_demo_button.configure(state="normal" if idle and not self.closing else "disabled")
+        self.send_client_button.configure(state="normal" if self.children["Client"].running and self.client_ready and not self.closing else "disabled")
+        role = "Standby serving" if self.active_role == "backup" else "Primary serving"
+        self.health_text.set(f"{self.reported_health} · {role}" if monitor_active and self.reported_health == "ONLINE"
+                             else self.reported_health if monitor_active else "Monitor stopped")
+        if self.last_heartbeat_at is not None:
+            self.beat_text.set(f"{self.heartbeat_count} heartbeats · Last received {time.monotonic() - self.last_heartbeat_at:.1f}s ago")
         else:
-            age = time.monotonic() - self.last_heartbeat_at
-            suffix = " (monitor stopped)" if not monitor_active else ""
-            self.beat_text.set(
-                f"Accepted heartbeats: {self.heartbeat_count} | Last observed {age:.1f}s ago{suffix}")
-
+            self.beat_text.set("No heartbeats received")
         if self.closing:
-            observation = "Stopping child processes and closing..."
-        elif not monitor_active:
-            observation = "Start the monitor, then the service. Separate terminal sessions are not tracked."
-        elif self.children["Service"].running:
-            observation = "Service is running. An armed attack will take over after it disconnects." if self.children[
-                "Attack"].running else "Service is running. Start the attack now to arm automatic takeover."
-        elif self.reported_health == "ONLINE" and self.service_stopped_at is not None:
-            elapsed = time.monotonic() - self.service_stopped_at
-            timeout = self.timeout_seconds
-            if timeout is None or elapsed < timeout + 0.5:
-                observation = "Service stopped; ONLINE can be normal while the monitor's timeout window expires."
-            elif self.last_heartbeat_at is not None and self.last_heartbeat_at > self.service_stopped_at:
-                observation = "Possible false liveness: the GUI-launched service is stopped, but accepted heartbeats keep the monitor ONLINE beyond its timeout."
-            else:
-                observation = "Service stopped; monitor still reports ONLINE. Check the monitor log for delayed or missing alerts."
-        elif self.reported_health == "DOWN":
-            observation = "The monitor reports DOWN. Start an attack to test whether fake heartbeats make it report ONLINE."
-        elif not self.service_has_run:
-            observation = "Start the service to establish a baseline. Processes started outside this window are not tracked."
+            text = "Stopping processes and closing…"
+        elif audit_running:
+            text = "Audit running in its own test environment. Follow its results in the audit panel."
+        elif self.active_role == "backup":
+            text = "The standby has taken over. Send GET_STATE or GET_CERT to inspect retained pre-crash state."
+        elif self.reported_health in ("DOWN", "RECOVERING") and monitor_active:
+            text = "Primary failure detected. Watch the monitor promote the standby."
+        elif self.service_stopped_at is not None and monitor_active:
+            text = f"Primary stopped. The monitor waits {self.timeout_seconds:g}s after the last heartbeat before failover."
+        elif self.service_ready:
+            text = "Primary is serving. Store a value with ENCRYPT_KEY, then compare GET_STATE before and after recovery."
         else:
-            observation = "Service stopped. Start an attack after the monitor logs its disconnect."
-        self.observation.set(observation)
+            text = "Start Demo opens the monitor, standby, primary, then client. Stop terminal instances before starting."
+        self.observation.set(text)
+
+    def advance_startup(self):
+        if not self.starting_demo:
+            return
+        for name in ("Monitor", "Backup", "Service"):
+            child = self.children[name]
+            if child.process is not None and not child.running:
+                self.starting_demo = False
+                return
+        if self.monitor_ready and self.children["Backup"].process is None:
+            self.starting_demo = self.start("Backup")
+        if self.backup_ready and self.children["Service"].process is None:
+            self.starting_demo = self.start("Service")
+        if self.service_ready and self.children["Client"].process is None:
+            self.start("Client")
+            self.starting_demo = False
 
     def tick(self):
-        # Bound work per tick so a burst of logs cannot freeze the window.
-        for _ in range(300):
+        for _ in range(500):
             try:
                 name, process, line = self.events.get_nowait()
             except queue.Empty:
                 break
             if self.children[name].process is not process:
-                continue  # Ignore delayed output from a previous run.
+                continue
             self.append_log(name, line)
-            child = self.children[name]
-            if name == "Monitor" and child.running and child.stop_deadline is None:
+            if name == "Monitor" and self.children[name].stop_deadline is None:
                 self.read_monitor_event(line)
-            elif name == "Attack":
-                if line.startswith(("Attack active;", "Attack reconnected.")):
-                    self.attack_active = True
-
+            elif name == "Backup" and "WARM STANDBY" in line:
+                self.backup_ready = True
+            elif name == "Service" and "Primary listening on " in line:
+                self.service_ready = True
+            elif name == "Client" and "Enter action: " in line:
+                self.client_ready = True
+            elif name == "Attack" and line.startswith(("Attack active;", "Attack reconnected.")):
+                self.attack_active = True
         for name, child in self.children.items():
             if child.process is None:
                 continue
-            if child.running:
-                if child.stop_deadline is not None and time.monotonic() >= child.stop_deadline:
-                    try:
-                        child.process.kill()
-                        self.note(
-                            name, "Process did not stop in time; sent kill.")
-                    except ProcessLookupError:
-                        pass
-                    except OSError as error:
-                        self.note(name, f"Could not kill: {error}")
-                    child.stop_deadline = time.monotonic() + 2
-            elif not child.exit_reported:
+            if child.running and child.stop_deadline is not None and time.monotonic() >= child.stop_deadline:
+                self.signal_child(child, signal.SIGKILL)
+                child.stop_deadline = time.monotonic() + 2
+            elif not child.running and not child.exit_reported:
                 child.exit_reported = True
-                self.note(
-                    name, f"Exited with code {child.process.returncode}.")
+                self.note(name, f"Exited with code {child.process.returncode}.")
+                # Also clean up monitor-created cold backups and audit children.
+                if name in ("Monitor", "Audit"):
+                    self.signal_child(child, signal.SIGTERM)
                 if name == "Monitor":
-                    self.monitor_ready = False
-                    self.monitor_connected = False
-                    self.reported_health = "UNKNOWN"
+                    self.monitor_ready = self.monitor_connected = False
                 elif name == "Service":
+                    self.service_ready = False
                     self.service_stopped_at = time.monotonic()
-
+                elif name == "Client":
+                    self.client_ready = False
+        self.advance_startup()
         self.update_display()
         if self.closing and not any(child.running for child in self.children.values()):
             self.root.destroy()
-            return
-        self.root.after(POLL_MS, self.tick)
+        else:
+            self.root.after(POLL_MS, self.tick)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve(
-    ).parents[1], help="Repository root; defaults to the parent of code/.")
+    parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args()
     project_root = args.project_root.expanduser().resolve()
     missing = [str(project_root / "code" / filename) for filename in SCRIPTS.values()
                if not (project_root / "code" / filename).is_file()]
     if missing:
-        parser.error(
-            "Missing project scripts; copy this file into code/ or pass --project-root.\n" + "\n".join(missing))
-    try:
-        root = tk.Tk()
-    except tk.TclError as error:
-        raise SystemExit(
-            f"Cannot open Tkinter: {error}. Check with: python -m tkinter") from error
+        parser.error("Missing project scripts:\n" + "\n".join(missing))
+    root = tk.Tk()
     DemoApp(root, project_root)
     root.mainloop()
 

@@ -25,7 +25,7 @@ import time
 
 PROJECT = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
-PORTS = (5000, 5001, 8000)
+PORTS = (5050, 5001, 8000)
 
 
 def assert_unused_ports():
@@ -58,7 +58,7 @@ def launch(script, args, folder, env, handles):
     return proc
 
 
-def request(port=5000):
+def request(port=5050):
     with socket.create_connection((HOST, port), timeout=1) as s:
         s.settimeout(1)
 
@@ -206,7 +206,7 @@ def split_brain_audit(folder, env):
 
         standby = launch(
             "backup_service_process.py",
-            ["--standby"],
+            ["127.0.0.1", "5050", "--standby"],
             folder,
             env,
             handles
@@ -214,7 +214,7 @@ def split_brain_audit(folder, env):
 
         primary = launch(
             "critical_service_process.py",
-            ["--crash-probability", "0"],
+            ["127.0.0.1", "5050", "--crash-probability", "0"],
             folder,
             env,
             handles

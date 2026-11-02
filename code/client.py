@@ -1,4 +1,5 @@
 import sys
+import uuid
 import socket
 import selectors
 import types
@@ -9,7 +10,7 @@ import logging
 import queue
 import threading
 
-CLIENT_ID = "client_01"
+CLIENT_ID = "client-" + uuid.uuid4().hex
 REQUEST_TIMEOUT = 5.0
 RECONNECT_INTERVAL = 1.0
 MAX_RECONNECT_WAIT = 30.0
