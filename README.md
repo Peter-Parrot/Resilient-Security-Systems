@@ -28,8 +28,8 @@ Install dependencies with `.venv/bin/python -m pip install -r requirements.txt` 
 ```
 
 1. Stop any monitor, service, or attack instances already running in your IDE or terminals. The GUI tracks only processes it launches, and duplicate listeners cannot share the same ports.
-2.  Click **Backup → Start**. The backup service listens for the promote signal on TCP `127.0.0.1:5001`. When it receives the promote signal, it closes its listening port on `5001` and reopens a port on `5000` to communicate with the Monitor Process.
-3. Click **Monitor → Start**, then **Service → Start**. The service listens for key requests on TCP `127.0.0.1:5000` and sends WebSocket heartbeats to the monitor on `127.0.0.1:8000` every 5 seconds.
+2.  Click **Backup → Start**. The backup service listens for the promote signal on TCP `127.0.0.1:5001`. When it receives the promote signal, it closes its listening port on `5001` and reopens a port on `5050` to communicate with the Monitor Process.
+3. Click **Monitor → Start**, then **Service → Start**. The service listens for key requests on TCP `127.0.0.1:5050` and sends WebSocket heartbeats to the monitor on `127.0.0.1:8000` every 5 seconds.
 4. Once the service is connected and `ONLINE`, click **Client → Start** to start the client process. Choose `LIST_KEYS`, `GET_CERT`, or `ENCRYPT_KEY` to determine the message type. The `Key ID` dropdown allows you to select which key/certificate to retrieve in `GET_CERT` messages. For `ENCRYPT_KEY` messages, you can either put in the plaintext to encrypt in the daemon, or an empty line with generate a random plaintext sequence. 
 5. Once the service is connected and `ONLINE`, choose `spoof`, `replay`, or `false-liveness` and click **Attack → Start**. Keep the attack interval at 2 seconds and duration at 30 seconds. The attack shows `Armed; waiting to take over` while the real service owns the monitor connection. Start the service before the attack so the attacker doesn't claim the empty slot first.
 6. Every 5 seconds, the service has a 10% chance of terminating its entire process with exit code 1. Look for `Injected stochastic crash` in the Service log. The expected wait is 50 seconds, but the actual wait is random and has no fixed upper bound.
@@ -49,19 +49,19 @@ Start the monitor in one terminal:
 Start the backup server in a second terminal:
 
 ```bash
-.venv/bin/python code/backup_service_process.py 127.0.0.1 5000
+.venv/bin/python code/backup_service_process.py 127.0.0.1 5050
 ```
 
 Start the service in a third terminal:
 
 ```bash
-.venv/bin/python code/critical_service_process.py 127.0.0.1 5000
+.venv/bin/python code/critical_service_process.py 127.0.0.1 5050
 ```
 
 Start the client in a fourth terminal:
 
 ```bash
-.venv/bin/python code/client.py 127.0.0.1 5000
+.venv/bin/python code/client.py 127.0.0.1 5050
 ```
 
 While the service is connected, arm one attack in a fifth terminal. It will wait until the service disconnects, then take over automatically:
@@ -74,7 +74,7 @@ While the service is connected, arm one attack in a fifth terminal. It will wait
 .venv/bin/python code/adversarial_audit_script.py false-liveness --interval 2 --duration 30
 ```
 
-In PyCharm, use the repository root as the working directory for all three configurations and `.venv/bin/python` as the interpreter. Service parameters are `127.0.0.1 5000`; audit parameters can be `spoof --interval 2 --duration 30`; the monitor needs no parameters. The service also defaults to `127.0.0.1:5000` when run without parameters.
+In PyCharm, use the repository root as the working directory for all three configurations and `.venv/bin/python` as the interpreter. Service parameters are `127.0.0.1 5050`; audit parameters can be `spoof --interval 2 --duration 30`; the monitor needs no parameters. The service also defaults to `127.0.0.1:5000` when run without parameters.
 
 For key-service debugging without injected faults, append `--crash-probability 0` to the service command. For a shorter but still random demo, use `--crash-probability 0.25 --crash-interval 5` (20-second expected wait, not a guaranteed deadline).
 
