@@ -307,3 +307,5 @@ Shenanigans/test_monitor_process.py
 
 #logs
 *.log
+
+state/

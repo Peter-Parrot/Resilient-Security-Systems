@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 
-DEFAULT_STATE_FILE = Path(__file__).resolve().parent.parent / "state" / "vault.json"
+DEFAULT_STATE_FILE = Path(__file__).resolve().parent / "state" / "vault.json"
 
 INITIAL_KEYS = {
     "key1": {
