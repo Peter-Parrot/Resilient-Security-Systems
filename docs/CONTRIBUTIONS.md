@@ -18,5 +18,5 @@ Worked on and implemented the dynamic state handling with failover. Showing clie
 Configured GUI to work with phase 2
 
 ### Ethan Sheffield
-Part 1: Designed the Client <--> Server Communication Protocol and implemented the client process. Recorded the demo video and voice-over.
+Part 1: Designed the Client <--> Server Communication Protocol and implemented the client process. Recorded the demo video and voice-over.  
 Part 2: Implemented the backup service process. 
