@@ -46,13 +46,13 @@ def create_request(request_num, action, key_id=None, plaintext_hash=None):
 def prompt_user_request(request_num):
     """Prompts the user for an action and any required fields."""
     while True:
-        print("\n--- Available Actions: LIST_KEYS | GET_CERT | ENCRYPT_KEY | QUIT ---")
+        print("\n--- Available Actions: LIST_KEYS | GET_STATE | GET_CERT | ENCRYPT_KEY | QUIT ---")
         action = input("Enter action: ").strip().upper()
 
         if action in ("QUIT", "EXIT"):
             return None
 
-        if action == "LIST_KEYS":
+        if action in ("LIST_KEYS", "GET_STATE"):
             return create_request(request_num, action)
 
         if action == "GET_CERT":
@@ -68,7 +68,7 @@ def prompt_user_request(request_num):
             return create_request(request_num, action, plaintext_hash=plaintext_hash)
 
         print(
-            f"Invalid action '{action}'. Please choose LIST_KEYS, GET_CERT, ENCRYPT_KEY, or QUIT.")
+            f"Invalid action '{action}'. Please choose LIST_KEYS, GET_STATE, GET_CERT, ENCRYPT_KEY, or QUIT.")
 
 
 def input_worker(request_queue, ready_for_input, stop_event):
