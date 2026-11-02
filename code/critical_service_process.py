@@ -7,6 +7,7 @@ import json
 import time
 import random
 import os
+import sys
 import threading
 
 import asyncio
@@ -16,17 +17,18 @@ from websockets.exceptions import ConnectionClosed
 
 URI = "ws://127.0.0.1:8000"
 HEARTBEAT_INTERVAL = 5
-STOCHASTIC_PROBABLIITY = 0.1
+STOCHASTIC_PROBABILITY = 0.0
 HOST = "127.0.0.1"
 PORT = 5000
+CONTROL_PORT = 5001
 
 sel = selectors.DefaultSelector()
 
 logging.basicConfig(
-    level=logging.INFO, 
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[
-        logging.FileHandler("key_storage_daemon.log"),
+    handlers=[
+        logging.FileHandler("backup_key_storage_daemon.log"),
         logging.StreamHandler()
     ]
 )
@@ -55,12 +57,12 @@ def handle_request(request_data):
     request_id = request_data.get("request_id")
     action = request_data.get("action")
     key_id = request_data.get("key_id")
-    
+
     response = {
         "request_id": request_id,
         "timestamp": time.time()
     }
-    
+
     if not action:
         response.update({
             "status": "ERROR",
@@ -68,7 +70,7 @@ def handle_request(request_data):
             "message": "Missing 'action' field in request."
         })
         return response
-        
+
     response["action"] = action
     if key_id is not None:
         response["key_id"] = key_id
@@ -91,7 +93,7 @@ def handle_request(request_data):
                 "error": "KEY_NOT_FOUND",
                 "message": f"Key ID '{key_id}' does not exist in vault."
             })
-            
+
     elif action == "ENCRYPT_KEY":
         plaintext_hash = request_data.get("plaintext_hash", "default-dummy-hash")
         # Simulate key encryption output
@@ -104,7 +106,7 @@ def handle_request(request_data):
                 "payload": encrypted_payload
             }
         })
-        
+
     elif action == "LIST_KEYS":
         keys_list = list(KEYS.keys())
         response.update({
@@ -121,19 +123,22 @@ def handle_request(request_data):
             "error": "UNKNOWN_ACTION",
             "message": f"Unsupported action '{action}'."
         })
-        
+
     return response
+
 
 def accept_wrapper(sock):
     conn, addr = sock.accept()
     print(f"Accepted connection from {addr}")
     conn.setblocking(False)
     data = types.SimpleNamespace(
-        addr=addr, 
-        inb=b"", 
-        outb=b"")
+        addr=addr,
+        inb=b"",
+        outb=b""
+    )
     events = selectors.EVENT_READ | selectors.EVENT_WRITE
     sel.register(conn, events, data=data)
+
 
 def service_connection(key, mask):
     sock = key.fileobj
@@ -185,23 +190,23 @@ def service_connection(key, mask):
 
 
 async def send_heartbeats():
-    # Outer loop ensures the client attempts to reconnect if disconnected
+    # Outer loop ensures the backup attempts to reconnect if disconnected
     while True:
         try:
             logging.info("Connecting to monitor at %s...", URI)
-            
+
             async with connect(URI) as websocket:
                 logging.info("Connected. Starting heartbeat transmission.")
-                
+
                 # Inner loop handles the continuous payload delivery
                 while True:
                     stochastic_crash()
                     payload = json.dumps({"type": "heartbeat"})
                     await websocket.send(payload)
                     logging.info("Heartbeat sent.")
-                    
+
                     await asyncio.sleep(HEARTBEAT_INTERVAL)
-                    
+
         except ConnectionClosed:
             logging.warning("Connection closed by server. Retrying in 5s...")
             await asyncio.sleep(5)
@@ -214,45 +219,149 @@ async def send_heartbeats():
 
 
 def start_heartbeat_thread():
-    asyncio.run(send_heartbeats()) 
+    asyncio.run(send_heartbeats())
+
 
 def stochastic_crash():
-    if random.random() < STOCHASTIC_PROBABLIITY:
-        print("Simulated System Crash, Server is Down")
+    if STOCHASTIC_PROBABILITY > 0 and random.random() < STOCHASTIC_PROBABILITY:
+        print("Simulated System Crash, Backup Server is Down", flush=True)
         os._exit(1)
 
 
+def is_service_listening(host, port):
+    """Checks whether a server is currently accepting connections on (host, port)."""
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def send_promote_signal(host, control_port):
+    """Sends a PROMOTE command to a running warm-standby backup server if one is listening."""
+    try:
+        with socket.create_connection((host, control_port), timeout=1.0) as conn:
+            conn.sendall((json.dumps({"action": "PROMOTE"}) + "\n").encode("utf-8"))
+            resp = conn.makefile().readline()
+            if resp:
+                data = json.loads(resp)
+                return data.get("status") == "PROMOTED"
+    except (OSError, json.JSONDecodeError):
+        pass
+    return False
+
+
+def wait_for_promotion_signal(host, control_port):
+    """Runs in Warm Standby mode on control_port until a PROMOTE signal arrives."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as ctrl_sock:
+        ctrl_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        ctrl_sock.bind((host, control_port))
+        ctrl_sock.listen(1)
+        logging.info(
+            "Backup server in WARM STANDBY mode (control listener on %s:%d). Waiting for promotion signal...",
+            host, control_port
+        )
+        print(f"Warm standby waiting for promotion signal on {(host, control_port)}", flush=True)
+
+        while True:
+            conn, addr = ctrl_sock.accept()
+            with conn:
+                try:
+                    raw = conn.recv(1024).decode("utf-8").strip()
+                    msg = json.loads(raw) if raw else {}
+                    if msg.get("action") == "PROMOTE" or raw.upper() == "PROMOTE":
+                        logging.info("Promotion signal received from %s! Activating backup server...", addr)
+                        conn.sendall((json.dumps({"status": "PROMOTED"}) + "\n").encode("utf-8"))
+                        return
+                except (OSError, json.JSONDecodeError) as e:
+                    logging.warning("Invalid message on standby control port: %s", e)
+
+
+def bind_service_socket(host, port, retries=20, delay=0.25):
+    """Binds to the primary service address, retrying briefly if the port is still releasing."""
+    for attempt in range(1, retries + 1):
+        lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            lsock.bind((host, port))
+            lsock.listen()
+            lsock.setblocking(False)
+            return lsock
+        except OSError as e:
+            lsock.close()
+            if attempt == retries:
+                raise
+            logging.warning(
+                "Port %s:%d busy (attempt %d/%d: %s), retrying in %.2fs...",
+                host, port, attempt, retries, e, delay
+            )
+            time.sleep(delay)
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Key service with heartbeat and random failure injection.")
-    parser.add_argument("host", nargs="?", default="127.0.0.1")
-    parser.add_argument("port", nargs="?", type=int, default=5000)
-    parser.add_argument("--crash-probability", type=float, default=0.1,
-                        help="Probability per background check; 0 disables faults (default: 0.1).")
-    parser.add_argument("--crash-interval", type=float, default=5.0,
+    parser = argparse.ArgumentParser(
+        description="Backup key service supporting Warm Standby promotion and failover."
+    )
+    parser.add_argument("host", nargs="?", default=None)
+    parser.add_argument("port", nargs="?", type=int, default=None)
+    parser.add_argument("--control-port", type=int, default=CONTROL_PORT,
+                        help="Control port used to receive the warm-standby promotion signal (default: 5001).")
+    parser.add_argument("--standby", action="store_true",
+                        help="Start in Warm Standby mode and wait for a promotion signal.")
+    parser.add_argument("--promote", action="store_true",
+                        help="Send a promotion signal to a running Warm Standby instance and exit.")
+    parser.add_argument("--crash-probability", type=float, default=STOCHASTIC_PROBABILITY,
+                        help="Probability per background check; 0 disables faults (default: 0.0).")
+    parser.add_argument("--crash-interval", type=float, default=float(HEARTBEAT_INTERVAL),
                         help="Seconds between random fault checks (default: 5).")
     args = parser.parse_args()
     if not math.isfinite(args.crash_probability) or not 0 <= args.crash_probability <= 1:
         parser.error("Crash probability must be between 0 and 1.")
     if not math.isfinite(args.crash_interval) or args.crash_interval <= 0:
         parser.error("Crash interval must be finite and positive.")
-    host, port = args.host, args.port
 
-    lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    lsock.bind((HOST, PORT))
-    lsock.listen()
-    print(f"Listening on {(HOST, PORT)}")
-    lsock.setblocking(False)
+    explicit_target = args.host is not None and args.port is not None
+    HOST = args.host if args.host is not None else HOST
+    PORT = args.port if args.port is not None else PORT
+    CONTROL_PORT = args.control_port
+    STOCHASTIC_PROBABILITY = args.crash_probability
+    HEARTBEAT_INTERVAL = args.crash_interval
+
+    # If invoked with --promote, signal the running Warm Standby server and exit.
+    if args.promote:
+        if send_promote_signal(HOST, CONTROL_PORT):
+            logging.info("Successfully promoted Warm Standby instance on %s:%d.", HOST, CONTROL_PORT)
+            sys.exit(0)
+        else:
+            logging.error("No Warm Standby instance responded on %s:%d.", HOST, CONTROL_PORT)
+            sys.exit(1)
+
+    # 1. If a Warm Standby instance is already waiting on CONTROL_PORT when failover invokes this script,
+    #    send it the PROMOTE signal so the pre-warmed process takes over port 5000.
+    if not args.standby and send_promote_signal(HOST, CONTROL_PORT):
+        logging.info("Signaled running Warm Standby instance on %s:%d to promote to active.", HOST, CONTROL_PORT)
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            os._exit(0)
+
+    # 2. Enter Warm Standby mode when started manually (`python backup_service_process.py`),
+    #    when `--standby` is passed, or when the Primary server is currently active on (HOST, PORT).
+    if args.standby or not explicit_target or is_service_listening(HOST, PORT):
+        wait_for_promotion_signal(HOST, CONTROL_PORT)
+
+    # 3. Promote to active: bind to (HOST, PORT), connect to the Heartbeat Monitor, and serve client requests.
+    lsock = bind_service_socket(HOST, PORT)
+    logging.info("Backup server promoted and listening on (%s, %d)", HOST, PORT)
+    print(f"Listening on {(HOST, PORT)}", flush=True)
     sel.register(lsock, selectors.EVENT_READ, data=None)
-    
+
     async_heartbeat_thread = threading.Thread(target=start_heartbeat_thread, daemon=True)
     async_heartbeat_thread.start()
     if args.crash_probability > 0:
         logging.info("Random fault checks every %s seconds, probability %s.",
                      args.crash_interval, args.crash_probability)
-        threading.Thread(target=stochastic_crash,
-                         args=(args.crash_probability, args.crash_interval), daemon=True).start()
-
 
     try:
         while True:

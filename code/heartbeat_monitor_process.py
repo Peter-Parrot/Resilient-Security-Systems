@@ -29,7 +29,7 @@ TIMEOUT = HEARTBEAT_INTERVAL * 3
 
 # Backup service configuration
 SERVICE_HOST = "127.0.0.1"
-SERVICE_PORT = 5000
+SERVICE_PORT = 5050
 
 BACKUP_SCRIPT = Path(__file__).resolve().parent / "backup_service_process.py"
 
