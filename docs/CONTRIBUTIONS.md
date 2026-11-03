@@ -8,7 +8,10 @@ Updated the heartbeat monitor to trigger failover when the server is unresponsiv
 Did the adversarial assessment.
 
 ### Evan Zamore
+Part 1:
 Implemented critical service process
+Part 2:
+Video
 
 ### Reese Edens
 Part 1:  
