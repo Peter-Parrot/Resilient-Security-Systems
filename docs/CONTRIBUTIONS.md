@@ -9,9 +9,10 @@ Did the adversarial assessment.
 
 ### Evan Zamore
 Part 1:
-Implemented critical service process
+Implemented critical service process.
+
 Part 2:
-Video
+Video.
 
 ### Reese Edens
 Part 1:  
